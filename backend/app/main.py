@@ -1,14 +1,22 @@
-import json
-from datetime import date, datetime, timezone
+from datetime import date
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
-from app.db import connect
-from app.engines.fefo import consume_fefo, expire_lots
+from app.db import connect, connect_immediate
+from app.engines.fefo import expire_lots
+from app.modules.consume import LAYERS, run_consume
 
 app = FastAPI(title="Pantryfifo", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+FRIDGE_SELECT = """SELECT lots.id, lots.item_id, lots.qty_in, lots.qty_remain,
+       lots.expiry, lots.status, lots.data_quality,
+       lots.layer AS lot_layer, items.name, items.layer AS item_layer, items.unit,
+       COALESCE(lots.layer, items.layer) AS layer,
+       CASE WHEN lots.layer IS NOT NULL AND lots.layer<>items.layer THEN 1 ELSE 0 END AS layer_mismatch
+FROM lots JOIN items ON items.id=lots.item_id
+WHERE lots.status='on_shelf'"""
 
 @app.on_event("startup")
 def _startup(): seed.init_db()
@@ -23,11 +31,13 @@ def items():
 @app.get("/api/fridge")
 def fridge(layer: str | None = None):
     c = connect()
-    q = """SELECT lots.*, items.name, items.layer, items.unit FROM lots
-           JOIN items ON items.id=lots.item_id WHERE lots.status='on_shelf'"""
+    q = FRIDGE_SELECT
     args = []
     if layer:
-        q += " AND items.layer=?"; args.append(layer)
+        if layer not in LAYERS:
+            c.close(); raise HTTPException(400, "invalid_layer")
+        # 层页过滤按批的有效层，不再按 items.layer（批层可与品项层不一致）
+        q += " AND COALESCE(lots.layer, items.layer)=?"; args.append(layer)
     rows = [dict(r) for r in c.execute(q, args)]; c.close(); return rows
 
 @app.get("/api/alerts")
@@ -36,7 +46,12 @@ def alerts():
     warn = int(c.execute("SELECT value FROM settings WHERE key='warn_days'").fetchone()["value"])
     today = date.today().isoformat()
     rows = [dict(r) for r in c.execute(
-        """SELECT lots.*, items.name, items.layer FROM lots JOIN items ON items.id=lots.item_id
+        """SELECT lots.id, lots.item_id, lots.qty_in, lots.qty_remain, lots.expiry,
+                  lots.status, lots.data_quality, lots.layer AS lot_layer,
+                  items.name, items.layer AS item_layer,
+                  COALESCE(lots.layer, items.layer) AS layer,
+                  CASE WHEN lots.layer IS NOT NULL AND lots.layer<>items.layer THEN 1 ELSE 0 END AS layer_mismatch
+           FROM lots JOIN items ON items.id=lots.item_id
            WHERE status='on_shelf' AND qty_remain>0 AND expiry IS NOT NULL""")]
     c.close()
     out = []
@@ -45,7 +60,6 @@ def alerts():
             r["level"] = "expired"
             out.append(r)
         else:
-            # simple day diff via fromisoformat
             delta = (date.fromisoformat(r["expiry"]) - date.today()).days
             if delta <= warn:
                 r["level"] = "soon"; r["days_left"] = delta; out.append(r)
@@ -55,49 +69,72 @@ class LotIn(BaseModel):
     item_id: int
     qty: float
     expiry: str
+    layer: str | None = None  # 留空=继承品项层
 
 @app.post("/api/lots")
 def inbound(body: LotIn):
+    if body.layer is not None and body.layer not in LAYERS:
+        raise HTTPException(400, "invalid_layer")
     c = connect()
     item = c.execute("SELECT id FROM items WHERE id=?", (body.item_id,)).fetchone()
     if not item: c.close(); raise HTTPException(404, "item")
     cur = c.execute(
-        "INSERT INTO lots(item_id,qty_in,qty_remain,expiry,status,data_quality) VALUES (?,?,?,?,?,?)",
-        (body.item_id, body.qty, body.qty, body.expiry, "on_shelf", "clean"))
+        "INSERT INTO lots(item_id,qty_in,qty_remain,expiry,status,data_quality,layer) VALUES (?,?,?,?,?,?,?)",
+        (body.item_id, body.qty, body.qty, body.expiry, "on_shelf", "clean", body.layer))
     c.commit(); lid = cur.lastrowid; c.close(); return {"id": lid}
+
+class ExpectedDeduction(BaseModel):
+    lot_id: int
+    take: float
 
 class ConsumeIn(BaseModel):
     item_id: int
     qty: float
     note: str = ""
+    layer: str | None = None            # 非空=层页本层消费；None=全层入口可跨层
+    expected_deductions: list[ExpectedDeduction] | None = None
+
+def _dispatch(body: ConsumeIn, dry_run: bool):
+    expected = None
+    if body.expected_deductions is not None:
+        expected = [d.model_dump() for d in body.expected_deductions]
+    status, resp = run_consume(item_id=body.item_id, qty=body.qty, layer=body.layer,
+                               dry_run=dry_run, note=body.note,
+                               expected_deductions=expected)
+    if status != 200:
+        # 400/404/503 的 resp 是 {"detail": 标记串}；409 的 resp 本身是 plan
+        detail = resp.get("detail", resp) if isinstance(resp, dict) else resp
+        raise HTTPException(status, detail)
+    return resp
+
+@app.post("/api/consume/preview")
+def consume_preview(body: ConsumeIn):
+    # 只读预演：恒 200，short 在 body.ok=false 中表达
+    return _dispatch(body, True)
 
 @app.post("/api/consume")
 def consume(body: ConsumeIn):
-    c = connect()
-    lots = [dict(r) for r in c.execute(
-        "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0", (body.item_id,))]
-    result = consume_fefo(lots, body.qty)
-    if not result["ok"] and result["reason"] == "qty_non_positive":
-        c.close(); raise HTTPException(400, result["reason"])
-    if not result["ok"]:
-        c.close(); raise HTTPException(409, result)
-    for d in result["deductions"]:
-        c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
-        rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
-        if rem <= 0:
-            c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
-    c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
-              (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close(); return result
+    # 确认：BEGIN IMMEDIATE 锁内重算后写入，回包即实际写入
+    return _dispatch(body, False)
 
 @app.post("/api/expire-sweep")
 def expire_sweep():
-    c = connect()
-    lots = [dict(r) for r in c.execute("SELECT * FROM lots WHERE status='on_shelf'")]
-    ids = expire_lots(lots, date.today().isoformat())
-    for i in ids:
-        c.execute("UPDATE lots SET status='expired' WHERE id=?", (i,))
-    c.commit(); c.close(); return {"expired_ids": ids}
+    c = connect_immediate()
+    began = False
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        began = True
+        lots = [dict(r) for r in c.execute("SELECT * FROM lots WHERE status='on_shelf'")]
+        ids = expire_lots(lots, date.today().isoformat())
+        for i in ids:
+            c.execute("UPDATE lots SET status='expired' WHERE id=?", (i,))
+        c.execute("COMMIT")
+        began = False
+    finally:
+        if began:
+            c.execute("ROLLBACK")
+        c.close()
+    return {"expired_ids": ids}
 
 @app.get("/api/settings")
 def settings():
