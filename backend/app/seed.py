@@ -11,18 +11,25 @@ def init_db():
     CREATE TABLE IF NOT EXISTS consumptions(id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT, result_json TEXT, created_at TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
     """)
+    # lot-level layer: NULL means "follow the item's layer"; a set value pins the
+    # lot to that shelf even when it disagrees with the item's layer.
+    cols = [r["name"] for r in c.execute("PRAGMA table_info(lots)")]
+    if "layer" not in cols:
+        c.execute("ALTER TABLE lots ADD COLUMN layer TEXT")
     if c.execute("SELECT COUNT(*) c FROM items").fetchone()["c"] == 0:
         c.executemany("INSERT INTO items(name,layer,unit) VALUES (?,?,?)", [
             ("牛奶", "upper", "盒"), ("鸡蛋", "mid", "个"), ("冻饺", "lower", "袋"),
         ])
         c.executemany(
-            "INSERT INTO lots(item_id,qty_in,qty_remain,expiry,status,data_quality) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO lots(item_id,qty_in,qty_remain,expiry,status,data_quality,layer) VALUES (?,?,?,?,?,?,?)",
             [
-                (1, 2, 2, "2026-10-01", "on_shelf", "clean"),
-                (1, 1, 1, "2026-09-28", "on_shelf", "clean"),
-                (2, 12, 12, "2026-11-01", "on_shelf", "clean"),
-                (3, 1, 1, "2025-01-01", "on_shelf", "dirty"),
-                (2, -3, -3, "2026-12-01", "on_shelf", "dirty"),
+                (1, 2, 2, "2026-10-01", "on_shelf", "clean", "upper"),
+                # lot layer deliberately disagrees with the item layer (upper):
+                # it must list/filter/consume as a mid-layer lot everywhere.
+                (1, 1, 1, "2026-09-28", "on_shelf", "clean", "mid"),
+                (2, 12, 12, "2026-11-01", "on_shelf", "clean", "mid"),
+                (3, 1, 1, "2025-01-01", "on_shelf", "dirty", "lower"),
+                (2, -3, -3, "2026-12-01", "on_shelf", "dirty", "mid"),
             ],
         )
         c.execute("INSERT INTO settings(key,value) VALUES ('warn_days','3')")

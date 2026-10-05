@@ -1,11 +1,14 @@
-import json
-from datetime import date, datetime, timezone
+from datetime import date
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from app import seed
 from app.db import connect
-from app.engines.fefo import consume_fefo, expire_lots
+from app.engines.fefo import expire_lots
+from app.services.consume import (
+    BadQty, ConsumeBusy, ConsumeConflict, ItemNotFound, UnknownLayer,
+    confirm_consume, preview_consume,
+)
 
 app = FastAPI(title="Pantryfifo", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -22,12 +25,18 @@ def items():
 
 @app.get("/api/fridge")
 def fridge(layer: str | None = None):
+    """On-shelf lots placed by EFFECTIVE layer (lot layer wins over item layer),
+    so the full-fridge columns and the per-layer pages always agree."""
     c = connect()
-    q = """SELECT lots.*, items.name, items.layer, items.unit FROM lots
-           JOIN items ON items.id=lots.item_id WHERE lots.status='on_shelf'"""
+    q = """SELECT lots.id, lots.item_id, lots.qty_in, lots.qty_remain, lots.expiry,
+                  lots.status, lots.data_quality,
+                  lots.layer AS lot_layer, items.layer AS item_layer,
+                  COALESCE(lots.layer, items.layer) AS layer,
+                  items.name, items.unit
+           FROM lots JOIN items ON items.id=lots.item_id WHERE lots.status='on_shelf'"""
     args = []
     if layer:
-        q += " AND items.layer=?"; args.append(layer)
+        q += " AND COALESCE(lots.layer, items.layer)=?"; args.append(layer)
     rows = [dict(r) for r in c.execute(q, args)]; c.close(); return rows
 
 @app.get("/api/alerts")
@@ -36,7 +45,9 @@ def alerts():
     warn = int(c.execute("SELECT value FROM settings WHERE key='warn_days'").fetchone()["value"])
     today = date.today().isoformat()
     rows = [dict(r) for r in c.execute(
-        """SELECT lots.*, items.name, items.layer FROM lots JOIN items ON items.id=lots.item_id
+        """SELECT lots.id, lots.item_id, lots.qty_remain, lots.expiry,
+                  COALESCE(lots.layer, items.layer) AS layer, items.name
+           FROM lots JOIN items ON items.id=lots.item_id
            WHERE status='on_shelf' AND qty_remain>0 AND expiry IS NOT NULL""")]
     c.close()
     out = []
@@ -59,36 +70,59 @@ class LotIn(BaseModel):
 @app.post("/api/lots")
 def inbound(body: LotIn):
     c = connect()
-    item = c.execute("SELECT id FROM items WHERE id=?", (body.item_id,)).fetchone()
+    item = c.execute("SELECT id, layer FROM items WHERE id=?", (body.item_id,)).fetchone()
     if not item: c.close(); raise HTTPException(404, "item")
+    # pin the new lot to the item's current layer; later divergence is explicit
     cur = c.execute(
-        "INSERT INTO lots(item_id,qty_in,qty_remain,expiry,status,data_quality) VALUES (?,?,?,?,?,?)",
-        (body.item_id, body.qty, body.qty, body.expiry, "on_shelf", "clean"))
+        "INSERT INTO lots(item_id,qty_in,qty_remain,expiry,status,data_quality,layer) VALUES (?,?,?,?,?,?,?)",
+        (body.item_id, body.qty, body.qty, body.expiry, "on_shelf", "clean", item["layer"]))
     c.commit(); lid = cur.lastrowid; c.close(); return {"id": lid}
 
 class ConsumeIn(BaseModel):
     item_id: int
     qty: float
+    layer: str | None = None   # scope to one layer; None = whole fridge
+    borrow: bool = False       # layer-scoped only: spill into other layers when short
     note: str = ""
 
-@app.post("/api/consume")
-def consume(body: ConsumeIn):
+def _consume(body: ConsumeIn, commit: bool):
     c = connect()
-    lots = [dict(r) for r in c.execute(
-        "SELECT * FROM lots WHERE item_id=? AND status='on_shelf' AND qty_remain>0", (body.item_id,))]
-    result = consume_fefo(lots, body.qty)
-    if not result["ok"] and result["reason"] == "qty_non_positive":
-        c.close(); raise HTTPException(400, result["reason"])
-    if not result["ok"]:
-        c.close(); raise HTTPException(409, result)
-    for d in result["deductions"]:
-        c.execute("UPDATE lots SET qty_remain = qty_remain - ? WHERE id=?", (d["take"], d["lot_id"]))
-        rem = c.execute("SELECT qty_remain FROM lots WHERE id=?", (d["lot_id"],)).fetchone()["qty_remain"]
-        if rem <= 0:
-            c.execute("UPDATE lots SET status='consumed', qty_remain=0 WHERE id=?", (d["lot_id"],))
-    c.execute("INSERT INTO consumptions(note,result_json,created_at) VALUES (?,?,?)",
-              (body.note, json.dumps(result), datetime.now(timezone.utc).isoformat()))
-    c.commit(); c.close(); return result
+    try:
+        if commit:
+            return confirm_consume(c, item_id=body.item_id, qty=body.qty,
+                                   layer=body.layer, borrow=body.borrow, note=body.note)
+        return preview_consume(c, item_id=body.item_id, qty=body.qty,
+                               layer=body.layer, borrow=body.borrow)
+    except ItemNotFound:
+        raise HTTPException(404, "item")
+    except UnknownLayer:
+        raise HTTPException(400, "unknown_layer")
+    except BadQty:
+        raise HTTPException(400, "qty_non_positive")
+    except ConsumeConflict as e:
+        # 409 carries the fresh plan: caller sees the shortage and what WOULD
+        # be deducted now — never a stale success.
+        raise HTTPException(409, detail=e.plan)
+    except ConsumeBusy:
+        raise HTTPException(409, detail={"ok": False, "reason": "busy"})
+    finally:
+        c.close()
+
+@app.post("/api/consume/preview")
+def consume_preview(body: ConsumeIn):
+    """Dry-run: lots that WOULD be deducted, per layer. Writes nothing, so the
+    per-layer numbers stay put until confirm."""
+    return _consume(body, commit=False)
+
+@app.post("/api/consume/confirm")
+def consume_confirm(body: ConsumeIn):
+    """Atomic re-plan + write. Response lists every lot/layer actually hit."""
+    return _consume(body, commit=True)
+
+@app.post("/api/consume")
+def consume_legacy(body: ConsumeIn):
+    """Back-compat alias of /api/consume/confirm (whole-fridge FEFO by default)."""
+    return _consume(body, commit=True)
 
 @app.post("/api/expire-sweep")
 def expire_sweep():
